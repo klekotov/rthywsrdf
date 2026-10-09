@@ -1,5 +1,5 @@
-# bot.py — Inferno Sniper Bot v3 (proxy rotation + instant notifications)
-# pip install aiogram==3.2.0 cloudscraper python-dotenv
+# bot.py — Inferno Sniper Bot (aiogram 2.25.2)
+# pip install aiogram==2.25.2 cloudscraper
 
 import asyncio
 import itertools
@@ -10,22 +10,26 @@ import time
 from typing import Optional
 
 import cloudscraper
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 
-TELEGRAM_TOKEN  = "8710997820:AAGYDrSd2N13jNjiP2ZE1_O2Jcij1Xrh1n0"        # токен от @BotFather
-ALLOWED_USER_ID = 8694243714               # твой Telegram ID (@userinfobot)
-POLL_INTERVAL   = 0.05                       # интервал опроса в секундах
-PROXY_FILE      = "proxies.txt"              # путь к файлу прокси
+# ─── Config ───────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN  = "ВАШ_ТОКЕН"          # токен от @BotFather
+ALLOWED_USER_ID = 123456789             # ваш Telegram ID (@userinfobot)
+POLL_INTERVAL   = 0.05                  # интервал опроса в секундах
+PROXY_FILE      = "proxies.txt"         # файл с прокси
 BASE_URL        = "https://inferno-cookies.com/api/v1"
 BUY_TIMEOUT     = 6
+# ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+bot     = Bot(token=TELEGRAM_TOKEN, parse_mode=types.ParseMode.HTML)
+storage = MemoryStorage()
+dp      = Dispatcher(bot, storage=storage)
 
 
 # ─── Proxy Manager ────────────────────────────────────────────────────────────
@@ -34,15 +38,12 @@ def _parse_proxy_line(line: str) -> Optional[dict]:
     line = line.strip()
     if not line or line.startswith("#"):
         return None
-
     if line.startswith(("http://", "https://", "socks5://", "socks4://")):
         return {"http": line, "https": line}
-
     if "@" in line:
         auth, hostport = line.rsplit("@", 1)
         url = f"http://{auth}@{hostport}"
         return {"http": url, "https": url}
-
     parts = line.split(":")
     if len(parts) == 2:
         url = f"http://{parts[0]}:{parts[1]}"
@@ -51,8 +52,6 @@ def _parse_proxy_line(line: str) -> Optional[dict]:
         ip, port, user, pwd = parts
         url = f"http://{user}:{pwd}@{ip}:{port}"
         return {"http": url, "https": url}
-
-    log.warning(f"Не удалось распарсить прокси: {line}")
     return None
 
 
@@ -60,11 +59,11 @@ class ProxyManager:
     MAX_FAILS = 3
 
     def __init__(self, path: str):
-        self._lock       = threading.Lock()
-        self._proxies    = []
-        self._dead       = set()
-        self._fails      = {}
-        self._cycle      = None
+        self._lock    = threading.Lock()
+        self._proxies = []
+        self._dead    = set()
+        self._fails   = {}
+        self._cycle   = None
         self._load(path)
 
     def _load(self, path: str):
@@ -76,10 +75,10 @@ class ProxyManager:
                     if p:
                         proxies.append(p)
         except FileNotFoundError:
-            log.warning(f"{path} не найден — работаем без прокси")
+            log.warning(f"{path} не найден — без прокси")
         self._proxies = proxies
         self._cycle   = itertools.cycle(proxies) if proxies else None
-        log.info(f"Загружено {len(proxies)} прокси из {path}")
+        log.info(f"Прокси загружено: {len(proxies)}")
 
     def next(self) -> Optional[dict]:
         if not self._cycle or not self._proxies:
@@ -90,7 +89,7 @@ class ProxyManager:
                 key = p["http"]
                 if key not in self._dead:
                     return p
-        log.error("Все прокси мёртвые — работаем напрямую")
+        log.error("Все прокси мёртвые")
         return None
 
     def mark_dead(self, proxy: dict):
@@ -99,8 +98,7 @@ class ProxyManager:
             self._fails[key] = self._fails.get(key, 0) + 1
             if self._fails[key] >= self.MAX_FAILS:
                 self._dead.add(key)
-                alive = len(self._proxies) - len(self._dead)
-                log.warning(f"Прокси мёртв: {key} | Живых: {alive}/{len(self._proxies)}")
+                log.warning(f"Прокси мёртв: {key} | Живых: {self.alive}/{len(self._proxies)}")
 
     def mark_ok(self, proxy: dict):
         key = proxy["http"]
@@ -109,11 +107,11 @@ class ProxyManager:
             self._dead.discard(key)
 
     @property
-    def alive_count(self) -> int:
+    def alive(self) -> int:
         return len(self._proxies) - len(self._dead)
 
     @property
-    def total_count(self) -> int:
+    def total(self) -> int:
         return len(self._proxies)
 
     def make_scraper(self, proxy: Optional[dict]) -> cloudscraper.CloudScraper:
@@ -152,16 +150,7 @@ class SniperState:
     def init_proxies(self):
         self.proxy_mgr = ProxyManager(PROXY_FILE)
 
-    def get_scraper(self) -> cloudscraper.CloudScraper:
-        proxy = self.proxy_mgr.next() if self.proxy_mgr else None
-        return self.proxy_mgr.make_scraper(proxy) if self.proxy_mgr else \
-               cloudscraper.create_scraper(
-                   browser={"browser": "chrome", "platform": "windows", "mobile": False},
-                   delay=[0, 0],
-               ), proxy
-
     def scraper_with_proxy(self):
-        """Returns (scraper, proxy_dict_or_None)"""
         if not self.proxy_mgr:
             s = cloudscraper.create_scraper(
                 browser={"browser": "chrome", "platform": "windows", "mobile": False},
@@ -169,8 +158,7 @@ class SniperState:
             )
             return s, None
         proxy = self.proxy_mgr.next()
-        s = self.proxy_mgr.make_scraper(proxy)
-        return s, proxy
+        return self.proxy_mgr.make_scraper(proxy), proxy
 
 
 sniper = SniperState()
@@ -190,7 +178,7 @@ def _headers(token="") -> dict:
     return h
 
 
-def _api_get(path: str, token="") -> dict | list:
+def _api_get(path: str, token=""):
     s, proxy = sniper.scraper_with_proxy()
     try:
         r = s.get(f"{BASE_URL}{path}", headers=_headers(token), timeout=5)
@@ -211,8 +199,8 @@ def _api_post(path: str, payload: dict, token="") -> dict:
                    headers=_headers(token), timeout=BUY_TIMEOUT)
         if r.status_code == 401:
             if proxy:
-                sniper.proxy_mgr.mark_ok(proxy)   # not proxy fault
-            raise PermissionError("401 — token expired")
+                sniper.proxy_mgr.mark_ok(proxy)
+            raise PermissionError("401")
         r.raise_for_status()
         if proxy:
             sniper.proxy_mgr.mark_ok(proxy)
@@ -226,11 +214,11 @@ def _api_post(path: str, payload: dict, token="") -> dict:
 
 
 def _login(email: str, password: str) -> str:
-    data = _api_post("/auth/login", {"email": email, "password": password})
+    data  = _api_post("/auth/login", {"email": email, "password": password})
     token = data.get("token") or data.get("access_token") or \
             data.get("data", {}).get("token", "")
     if not token:
-        raise ValueError(f"Нет токена в ответе: {data}")
+        raise ValueError(f"Нет токена: {data}")
     return token
 
 
@@ -248,18 +236,13 @@ def _buy(pid: str, qty: int, token: str) -> dict:
 
 # ─── Sniper Loop ──────────────────────────────────────────────────────────────
 
-async def run_in_thread(fn):
-    return await asyncio.get_event_loop().run_in_executor(None, fn)
-
-
-async def do_buy(bot: Bot, product: dict):
+async def do_buy(product: dict):
     pid   = product["id"]
     title = product["title"]
     price = product.get("price", 0)
     avail = product.get("available_count", sniper.target_quantity)
     qty   = min(sniper.target_quantity, avail)
 
-    # ── Уведомление: завоз обнаружен, покупаю ──────────────────────────────
     await bot.send_message(
         sniper.notify_chat_id,
         f"🚀 <b>ЗАВОЗ ОБНАРУЖЕН!</b>\n\n"
@@ -267,28 +250,27 @@ async def do_buy(bot: Bot, product: dict):
         f"🔢 Покупаю: {qty} шт.\n"
         f"💰 Сумма: {float(price) * qty:.2f} руб.\n"
         f"⚡ Покупаю прямо сейчас...",
-        parse_mode="HTML",
     )
 
     t0 = time.monotonic()
 
+    loop = asyncio.get_event_loop()
     try:
-        await run_in_thread(lambda: _buy(pid, qty, sniper.auth_token))
+        await loop.run_in_executor(None, lambda: _buy(pid, qty, sniper.auth_token))
     except PermissionError:
         log.warning("Token expired, re-login...")
-        sniper.auth_token = await run_in_thread(
-            lambda: _login(sniper.email, sniper.password)
+        sniper.auth_token = await loop.run_in_executor(
+            None, lambda: _login(sniper.email, sniper.password)
         )
-        await run_in_thread(lambda: _buy(pid, qty, sniper.auth_token))
+        await loop.run_in_executor(None, lambda: _buy(pid, qty, sniper.auth_token))
 
     elapsed_ms = (time.monotonic() - t0) * 1000
     sniper.bought_total += qty
 
     proxy_info = ""
     if sniper.proxy_mgr:
-        proxy_info = f"\n🌐 Прокси живых: {sniper.proxy_mgr.alive_count}/{sniper.proxy_mgr.total_count}"
+        proxy_info = f"\n🌐 Прокси живых: {sniper.proxy_mgr.alive}/{sniper.proxy_mgr.total}"
 
-    # ── Уведомление: куплено ────────────────────────────────────────────────
     await bot.send_message(
         sniper.notify_chat_id,
         f"✅ <b>КУПЛЕНО!</b>\n\n"
@@ -298,18 +280,18 @@ async def do_buy(bot: Bot, product: dict):
         f"⚡ Скорость покупки: <b>{elapsed_ms:.0f}ms</b>\n"
         f"📦 Всего за сессию: {sniper.bought_total} шт."
         f"{proxy_info}",
-        parse_mode="HTML",
     )
     log.info(f"Bought {qty}x {title} in {elapsed_ms:.0f}ms")
 
 
-async def sniper_loop(bot: Bot):
-    log.info(f"Sniper started — poll every {POLL_INTERVAL}s")
+async def sniper_loop():
+    log.info(f"Sniper started — poll={POLL_INTERVAL}s")
     errors = 0
+    loop   = asyncio.get_event_loop()
 
     while sniper.running:
         try:
-            metrics   = await run_in_thread(_metrics)
+            metrics   = await loop.run_in_executor(None, _metrics)
             batch_at  = metrics.get("last_batch_at", "")
             available = metrics.get("available", 0)
 
@@ -318,8 +300,7 @@ async def sniper_loop(bot: Bot):
 
             if new_batch or stock_jump:
                 log.info(f"Restock! batch={batch_at} avail={available}")
-
-                products = await run_in_thread(_products)
+                products = await loop.run_in_executor(None, _products)
                 needle   = sniper.target_name.lower()
                 matches  = [
                     p for p in products
@@ -332,11 +313,10 @@ async def sniper_loop(bot: Bot):
                     await bot.send_message(
                         sniper.notify_chat_id,
                         f"⚠️ <b>Завоз есть</b>, но «{sniper.target_name}» не найден "
-                        f"или уже разобрали.\n📦 Доступно товаров всего: {available}",
-                        parse_mode="HTML",
+                        f"или уже разобрали.\n📦 Доступно всего: {available}",
                     )
                 else:
-                    await do_buy(bot, matches[0])
+                    await do_buy(matches[0])
 
                 sniper.last_batch_at = batch_at
 
@@ -350,7 +330,6 @@ async def sniper_loop(bot: Bot):
                 await bot.send_message(
                     sniper.notify_chat_id,
                     f"🚨 Снайпер ловит ошибки ({errors} подряд):\n<code>{e}</code>",
-                    parse_mode="HTML",
                 )
 
         await asyncio.sleep(POLL_INTERVAL)
@@ -358,21 +337,17 @@ async def sniper_loop(bot: Bot):
     log.info("Sniper stopped")
 
 
-# ─── Bot Handlers ─────────────────────────────────────────────────────────────
+# ─── Handlers ─────────────────────────────────────────────────────────────────
 
-bot = Bot(token=TELEGRAM_TOKEN)
-dp  = Dispatcher(storage=MemoryStorage())
-
-
-def guard(msg: Message) -> bool:
-    return ALLOWED_USER_ID == 0 or msg.from_user.id == ALLOWED_USER_ID
+def guard(user_id: int) -> bool:
+    return ALLOWED_USER_ID == 0 or user_id == ALLOWED_USER_ID
 
 
-@dp.message(Command("start"))
-async def cmd_start(msg: Message):
-    if not guard(msg): return
+@dp.message_handler(commands=["start"])
+async def cmd_start(msg: types.Message):
+    if not guard(msg.from_user.id): return
     await msg.answer(
-        "🎯 <b>Inferno Sniper Bot v3</b>\n\n"
+        "🎯 <b>Inferno Sniper Bot</b>\n\n"
         "/setup — настроить аккаунт и цель\n"
         "/start_sniper — запустить мониторинг\n"
         "/stop_sniper — остановить\n"
@@ -380,45 +355,43 @@ async def cmd_start(msg: Message):
         "/metrics — метрики магазина\n"
         "/proxies — статус прокси\n"
         "/setqty &lt;n&gt; — изменить количество\n"
-        "/setpoll &lt;сек&gt; — интервал опроса",
-        parse_mode="HTML",
+        "/setpoll &lt;сек&gt; — интервал опроса"
     )
 
 
-@dp.message(Command("setup"))
-async def cmd_setup(msg: Message, state: FSMContext):
-    if not guard(msg): return
-    await state.set_state(Setup.waiting_email)
+@dp.message_handler(commands=["setup"])
+async def cmd_setup(msg: types.Message):
+    if not guard(msg.from_user.id): return
+    await Setup.waiting_email.set()
     await msg.answer("📧 Email от аккаунта на inferno-cookies.com:")
 
 
-@dp.message(Setup.waiting_email)
-async def fsm_email(msg: Message, state: FSMContext):
+@dp.message_handler(state=Setup.waiting_email)
+async def fsm_email(msg: types.Message, state: FSMContext):
     await state.update_data(email=msg.text.strip())
-    await state.set_state(Setup.waiting_password)
+    await Setup.waiting_password.set()
     await msg.answer("🔑 Пароль:")
 
 
-@dp.message(Setup.waiting_password)
-async def fsm_password(msg: Message, state: FSMContext):
+@dp.message_handler(state=Setup.waiting_password)
+async def fsm_password(msg: types.Message, state: FSMContext):
     await state.update_data(password=msg.text.strip())
-    await state.set_state(Setup.waiting_target)
+    await Setup.waiting_target.set()
     await msg.answer(
         "🔍 Название товара (или его часть):\n"
-        "Пример: <code>Netflix</code> или <code>Spotify</code>",
-        parse_mode="HTML",
+        "Пример: <code>Netflix</code> или <code>Spotify</code>"
     )
 
 
-@dp.message(Setup.waiting_target)
-async def fsm_target(msg: Message, state: FSMContext):
+@dp.message_handler(state=Setup.waiting_target)
+async def fsm_target(msg: types.Message, state: FSMContext):
     await state.update_data(target=msg.text.strip())
-    await state.set_state(Setup.waiting_quantity)
+    await Setup.waiting_quantity.set()
     await msg.answer("🔢 Сколько штук купить при завозе?")
 
 
-@dp.message(Setup.waiting_quantity)
-async def fsm_qty(msg: Message, state: FSMContext):
+@dp.message_handler(state=Setup.waiting_quantity)
+async def fsm_qty(msg: types.Message, state: FSMContext):
     try:
         qty = int(msg.text.strip())
         assert qty >= 1
@@ -426,24 +399,25 @@ async def fsm_qty(msg: Message, state: FSMContext):
         await msg.answer("❌ Введи целое число >= 1")
         return
 
-    data                  = await state.get_data()
-    sniper.email          = data["email"]
-    sniper.password       = data["password"]
-    sniper.target_name    = data["target"]
+    data                   = await state.get_data()
+    sniper.email           = data["email"]
+    sniper.password        = data["password"]
+    sniper.target_name     = data["target"]
     sniper.target_quantity = qty
-    sniper.notify_chat_id = msg.chat.id
-    await state.clear()
+    sniper.notify_chat_id  = msg.chat.id
+    await state.finish()
 
     sniper.init_proxies()
     await msg.answer("🔐 Проверяю логин...")
 
     try:
-        sniper.auth_token = await run_in_thread(
-            lambda: _login(sniper.email, sniper.password)
+        loop = asyncio.get_event_loop()
+        sniper.auth_token = await loop.run_in_executor(
+            None, lambda: _login(sniper.email, sniper.password)
         )
         proxy_status = ""
-        if sniper.proxy_mgr and sniper.proxy_mgr.total_count > 0:
-            proxy_status = f"\n🌐 Прокси загружено: {sniper.proxy_mgr.total_count} шт."
+        if sniper.proxy_mgr and sniper.proxy_mgr.total > 0:
+            proxy_status = f"\n🌐 Прокси загружено: {sniper.proxy_mgr.total} шт."
 
         await msg.answer(
             f"✅ <b>Авторизован!</b>\n\n"
@@ -451,16 +425,15 @@ async def fsm_qty(msg: Message, state: FSMContext):
             f"🎯 Цель: <b>{sniper.target_name}</b>\n"
             f"🔢 Количество: {qty}"
             f"{proxy_status}\n\n"
-            f"Запусти /start_sniper",
-            parse_mode="HTML",
+            f"Запусти /start_sniper"
         )
     except Exception as e:
         await msg.answer(f"❌ Ошибка авторизации: {e}\nПопробуй /setup снова.")
 
 
-@dp.message(Command("start_sniper"))
-async def cmd_start_sniper(msg: Message):
-    if not guard(msg): return
+@dp.message_handler(commands=["start_sniper"])
+async def cmd_start_sniper(msg: types.Message):
+    if not guard(msg.from_user.id): return
     if not sniper.auth_token:
         await msg.answer("⚠️ Сначала /setup")
         return
@@ -469,36 +442,35 @@ async def cmd_start_sniper(msg: Message):
         return
     sniper.running = True
     sniper.notify_chat_id = msg.chat.id
-    asyncio.create_task(sniper_loop(bot))
+    asyncio.create_task(sniper_loop())
 
     proxy_line = ""
-    if sniper.proxy_mgr and sniper.proxy_mgr.total_count > 0:
-        proxy_line = f"\n🌐 Прокси: {sniper.proxy_mgr.alive_count}/{sniper.proxy_mgr.total_count} живых"
+    if sniper.proxy_mgr and sniper.proxy_mgr.total > 0:
+        proxy_line = f"\n🌐 Прокси: {sniper.proxy_mgr.alive}/{sniper.proxy_mgr.total} живых"
 
     await msg.answer(
         f"🟢 <b>Снайпер запущен!</b>\n\n"
         f"🎯 Цель: <b>{sniper.target_name}</b>\n"
         f"🔢 Куплю: {sniper.target_quantity} шт.\n"
         f"⚡ Интервал: {POLL_INTERVAL}с"
-        f"{proxy_line}",
-        parse_mode="HTML",
+        f"{proxy_line}"
     )
 
 
-@dp.message(Command("stop_sniper"))
-async def cmd_stop_sniper(msg: Message):
-    if not guard(msg): return
+@dp.message_handler(commands=["stop_sniper"])
+async def cmd_stop_sniper(msg: types.Message):
+    if not guard(msg.from_user.id): return
     sniper.running = False
     await msg.answer("🔴 Снайпер остановлен.")
 
 
-@dp.message(Command("status"))
-async def cmd_status(msg: Message):
-    if not guard(msg): return
+@dp.message_handler(commands=["status"])
+async def cmd_status(msg: types.Message):
+    if not guard(msg.from_user.id): return
     st = "🟢 Работает" if sniper.running else "🔴 Остановлен"
     proxy_line = ""
-    if sniper.proxy_mgr and sniper.proxy_mgr.total_count > 0:
-        proxy_line = f"\n🌐 Прокси живых: {sniper.proxy_mgr.alive_count}/{sniper.proxy_mgr.total_count}"
+    if sniper.proxy_mgr and sniper.proxy_mgr.total > 0:
+        proxy_line = f"\n🌐 Прокси живых: {sniper.proxy_mgr.alive}/{sniper.proxy_mgr.total}"
     await msg.answer(
         f"<b>Статус снайпера</b>\n\n"
         f"Состояние: {st}\n"
@@ -508,49 +480,47 @@ async def cmd_status(msg: Message):
         f"⏱ Последний завоз: {sniper.last_batch_at or '—'}\n"
         f"📊 Доступно сейчас: {sniper.last_available}\n"
         f"⚡ Интервал опроса: {POLL_INTERVAL}с"
-        f"{proxy_line}",
-        parse_mode="HTML",
+        f"{proxy_line}"
     )
 
 
-@dp.message(Command("proxies"))
-async def cmd_proxies(msg: Message):
-    if not guard(msg): return
-    if not sniper.proxy_mgr or sniper.proxy_mgr.total_count == 0:
+@dp.message_handler(commands=["proxies"])
+async def cmd_proxies(msg: types.Message):
+    if not guard(msg.from_user.id): return
+    if not sniper.proxy_mgr or sniper.proxy_mgr.total == 0:
         await msg.answer("⚠️ Прокси не загружены. Запусти /setup сначала.")
         return
     pm = sniper.proxy_mgr
     await msg.answer(
         f"🌐 <b>Статус прокси</b>\n\n"
-        f"✅ Живых: {pm.alive_count}\n"
-        f"💀 Мёртвых: {pm.total_count - pm.alive_count}\n"
-        f"📊 Всего: {pm.total_count}",
-        parse_mode="HTML",
+        f"✅ Живых: {pm.alive}\n"
+        f"💀 Мёртвых: {pm.total - pm.alive}\n"
+        f"📊 Всего: {pm.total}"
     )
 
 
-@dp.message(Command("metrics"))
-async def cmd_metrics(msg: Message):
-    if not guard(msg): return
+@dp.message_handler(commands=["metrics"])
+async def cmd_metrics(msg: types.Message):
+    if not guard(msg.from_user.id): return
     if not sniper.proxy_mgr:
         sniper.init_proxies()
     try:
-        m = await run_in_thread(_metrics)
+        loop = asyncio.get_event_loop()
+        m    = await loop.run_in_executor(None, _metrics)
         await msg.answer(
             f"📊 <b>Метрики магазина</b>\n\n"
             f"✅ Всего продано: {m.get('total_sold', '?')}\n"
             f"📦 Доступно: {m.get('available', '?')}\n"
             f"🕐 Последний завоз: {m.get('last_batch_at', '?')}\n"
-            f"⚡ Среднее время доставки: {m.get('avg_delivery_seconds', '?')}с",
-            parse_mode="HTML",
+            f"⚡ Среднее время доставки: {m.get('avg_delivery_seconds', '?')}с"
         )
     except Exception as e:
         await msg.answer(f"❌ Ошибка: {e}")
 
 
-@dp.message(Command("setqty"))
-async def cmd_setqty(msg: Message):
-    if not guard(msg): return
+@dp.message_handler(commands=["setqty"])
+async def cmd_setqty(msg: types.Message):
+    if not guard(msg.from_user.id): return
     parts = msg.text.split()
     if len(parts) != 2 or not parts[1].isdigit():
         await msg.answer("Использование: /setqty 3")
@@ -559,15 +529,15 @@ async def cmd_setqty(msg: Message):
     await msg.answer(f"✅ Количество → {sniper.target_quantity}")
 
 
-@dp.message(Command("setpoll"))
-async def cmd_setpoll(msg: Message):
-    if not guard(msg): return
+@dp.message_handler(commands=["setpoll"])
+async def cmd_setpoll(msg: types.Message):
+    if not guard(msg.from_user.id): return
     parts = msg.text.split()
     try:
         val = float(parts[1])
-        assert val >= 0.3
+        assert val >= 0.05
     except (IndexError, ValueError, AssertionError):
-        await msg.answer("❌ Минимум 0.3с. Пример: /setpoll 0.5")
+        await msg.answer("❌ Минимум 0.05с. Пример: /setpoll 0.1")
         return
     global POLL_INTERVAL
     POLL_INTERVAL = val
@@ -576,10 +546,6 @@ async def cmd_setpoll(msg: Message):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-async def main():
-    log.info(f"Bot starting — poll={POLL_INTERVAL}s proxy_file={PROXY_FILE}")
-    await dp.start_polling(bot, allowed_updates=["message"])
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    log.info(f"Bot starting — poll={POLL_INTERVAL}s")
+    executor.start_polling(dp, skip_updates=True)
